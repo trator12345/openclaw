@@ -531,6 +531,11 @@ export function createMSTeamsMessageHandler(deps: MSTeamsMessageHandlerDeps) {
         replyOptions,
       });
 
+      dispatcher.markComplete();
+      // Teams thread replies depend on the inbound turn context. If we return
+      // before queued sends finish, the SDK revokes that context proxy and
+      // follow-up sends fail with "Cannot perform 'set' on a proxy that has been revoked".
+      await dispatcher.waitForIdle();
       markDispatchIdle();
       log.info("dispatch complete", { queuedFinal, counts });
 
