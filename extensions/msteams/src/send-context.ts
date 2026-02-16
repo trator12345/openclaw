@@ -10,6 +10,7 @@ import type {
 } from "./conversation-store.js";
 import type { MSTeamsAdapter } from "./messenger.js";
 import { createMSTeamsConversationStoreFs } from "./conversation-store-fs.js";
+import { createOneOnOneChatViaGraph, resolveGraphToken } from "./graph.js";
 import { getMSTeamsRuntime } from "./runtime.js";
 import { createMSTeamsAdapter, loadMSTeamsSdkWithAuth } from "./sdk.js";
 import { resolveMSTeamsCredentials } from "./token.js";
@@ -31,6 +32,8 @@ export type MSTeamsProactiveContext = {
   /** Resolved media max bytes from config (default: 100MB) */
   mediaMaxBytes?: number;
 };
+
+const DEFAULT_TEAMS_SERVICE_URL = "https://smba.trafficmanager.net/teams/";
 
 /**
  * Parse the target value into a conversation reference lookup key.
@@ -91,6 +94,72 @@ async function findConversationReference(recipient: {
   return { conversationId: found.conversationId, ref: found.reference };
 }
 
+function pickKnownServiceUrl(entries: Array<{ reference: StoredConversationReference }>): string {
+  for (const entry of entries) {
+    const serviceUrl = entry.reference.serviceUrl?.trim();
+    if (serviceUrl) {
+      return serviceUrl;
+    }
+  }
+  return DEFAULT_TEAMS_SERVICE_URL;
+}
+
+async function bootstrapUserConversationReference(params: {
+  cfg: OpenClawConfig;
+  recipient: { type: "conversation" | "user"; id: string };
+  store: MSTeamsConversationStore;
+  appId: string;
+  tenantId: string;
+  log: ReturnType<PluginRuntime["logging"]["getChildLogger"]>;
+}): Promise<{ conversationId: string; ref: StoredConversationReference } | null> {
+  if (params.recipient.type !== "user") {
+    return null;
+  }
+
+  try {
+    const token = await resolveGraphToken(params.cfg);
+    const conversationId = await createOneOnOneChatViaGraph({
+      token,
+      userId: params.recipient.id,
+    });
+    const existing = await params.store.list();
+    const ref: StoredConversationReference = {
+      user: {
+        id: params.recipient.id,
+        aadObjectId: params.recipient.id,
+      },
+      agent: {
+        id: params.appId,
+        name: "OpenClaw",
+      },
+      bot: {
+        id: params.appId,
+        name: "OpenClaw",
+      },
+      conversation: {
+        id: conversationId,
+        conversationType: "personal",
+        tenantId: params.tenantId,
+      },
+      channelId: "msteams",
+      serviceUrl: pickKnownServiceUrl(existing),
+    };
+
+    await params.store.upsert(conversationId, ref);
+    params.log.info("bootstrapped Teams personal conversation reference", {
+      userId: params.recipient.id,
+      conversationId,
+    });
+    return { conversationId, ref };
+  } catch (err) {
+    params.log.debug?.("failed to bootstrap Teams conversation reference", {
+      userId: params.recipient.id,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
+}
+
 export async function resolveMSTeamsSendContext(params: {
   cfg: OpenClawConfig;
   to: string;
@@ -108,20 +177,31 @@ export async function resolveMSTeamsSendContext(params: {
 
   const store = createMSTeamsConversationStoreFs();
 
+  const core = getMSTeamsRuntime();
+  const log = core.logging.getChildLogger({ name: "msteams:send" });
+
   // Parse recipient and find conversation reference
   const recipient = parseRecipient(params.to);
-  const found = await findConversationReference({ ...recipient, store });
+  const found =
+    (await findConversationReference({ ...recipient, store })) ??
+    (await bootstrapUserConversationReference({
+      cfg: params.cfg,
+      recipient,
+      store,
+      appId: creds.appId,
+      tenantId: creds.tenantId,
+      log,
+    }));
 
   if (!found) {
     throw new Error(
       `No conversation reference found for ${recipient.type}:${recipient.id}. ` +
-        `The bot must receive a message from this conversation before it can send proactively.`,
+        `Tried creating a new personal chat via Graph but could not bootstrap a conversation. ` +
+        `Ensure Chat.Create and Chat.ReadWrite.All application permissions are granted and admin-consented.`,
     );
   }
 
   const { conversationId, ref } = found;
-  const core = getMSTeamsRuntime();
-  const log = core.logging.getChildLogger({ name: "msteams:send" });
 
   const { sdk, authConfig } = await loadMSTeamsSdkWithAuth(creds);
   const adapter = createMSTeamsAdapter(authConfig, sdk);

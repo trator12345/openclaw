@@ -60,6 +60,28 @@ export async function fetchGraphJson<T>(params: {
   return (await res.json()) as T;
 }
 
+export async function postGraphJson<T>(params: {
+  token: string;
+  path: string;
+  body: unknown;
+  headers?: Record<string, string>;
+}): Promise<T> {
+  const res = await fetch(`${GRAPH_ROOT}${params.path}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${params.token}`,
+      "content-type": "application/json",
+      ...params.headers,
+    },
+    body: JSON.stringify(params.body),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Graph ${params.path} failed (${res.status}): ${text || "unknown error"}`);
+  }
+  return (await res.json()) as T;
+}
+
 export async function resolveGraphToken(cfg: unknown): Promise<string> {
   const creds = resolveMSTeamsCredentials(
     (cfg as { channels?: { msteams?: unknown } })?.channels?.msteams as MSTeamsConfig | undefined,
@@ -89,4 +111,30 @@ export async function listChannelsForTeam(token: string, teamId: string): Promis
   const path = `/teams/${encodeURIComponent(teamId)}/channels?$select=id,displayName`;
   const res = await fetchGraphJson<GraphResponse<GraphChannel>>({ token, path });
   return res.value ?? [];
+}
+
+export async function createOneOnOneChatViaGraph(params: {
+  token: string;
+  userId: string;
+}): Promise<string> {
+  const payload = {
+    chatType: "oneOnOne",
+    members: [
+      {
+        "@odata.type": "#microsoft.graph.aadUserConversationMember",
+        roles: ["owner"],
+        "user@odata.bind": `${GRAPH_ROOT}/users('${params.userId}')`,
+      },
+    ],
+  };
+  const chat = await postGraphJson<{ id?: string }>({
+    token: params.token,
+    path: "/chats",
+    body: payload,
+  });
+  const chatId = chat.id?.trim();
+  if (!chatId) {
+    throw new Error("Graph chat create response missing id");
+  }
+  return chatId;
 }
